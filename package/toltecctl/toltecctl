@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+# Copyright (c) 2021 The Toltec Contributors
+# SPDX-License-Identifier: MIT
+
+set -euo pipefail
+
+# Path where Toltec resides (will be mounted to $toltec_dest)
+toltec_src=/home/root/.entware
+
+# Path where Toltec is mounted
+toltec_dest=/opt
+
+# Create or update a bind mount systemd unit and enable it
+#
+# Arguments:
+#
+# $1 - Source directory
+# $2 - Mount point
+add-bind-mount() {
+    local unit_name
+    local unit_path
+    unit_name="$(systemd-escape --path "$2").mount"
+    unit_path="/lib/systemd/system/$unit_name"
+
+    if [[ -e $unit_path ]]; then
+        echo "Bind mount configuration for '$2' already exists, updating"
+    else
+        echo "Mounting '$1' over '$2'"
+    fi
+
+    cat > "$unit_path" << UNIT
+[Unit]
+Description=Bind mount $1 over $2
+DefaultDependencies=no
+Conflicts=umount.target
+Before=local-fs.target umount.target
+[Mount]
+What=$1
+Where=$2
+Type=none
+Options=bind
+[Install]
+WantedBy=local-fs.target
+UNIT
+
+    systemctl daemon-reload
+    systemctl enable "$unit_name"
+    systemctl restart "$unit_name"
+}
+
+# Disable and remove a bind mount systemd unit
+#
+# Arguments:
+#
+# $1 - Mount point
+remove-bind-mount() {
+    local unit_name
+    local unit_path
+    unit_name="$(systemd-escape --path "$1").mount"
+    unit_path="/lib/systemd/system/$unit_name"
+
+    if [[ ! -e $unit_path ]]; then
+        echo "No existing bind mount for '$1'"
+        return 1
+    fi
+
+    echo "Removing mount over '$1'"
+    systemctl disable "$unit_name"
+    systemctl stop "$unit_name"
+    rm "$unit_path"
+    systemctl daemon-reload
+}
+
+# Reinstall all Toltec packages that had files installed outside of
+# $toltec_src, e.g. systemd configuration files
+reinstall-root() {
+    opkg update
+
+    # Get the list of installed packages with files on root
+    local pkgname
+    declare -A on_root_packages
+    while read -r inst_line; do
+        pkgname="$(echo "$inst_line" | awk '{ print $1 }')"
+        if opkg files "$pkgname" | grep -v -e "/home/root" -e "$toltec_dest" \
+            -e "is installed on root" -q; then
+            on_root_packages[$pkgname]=1
+        fi
+    done < <(opkg list-installed)
+
+    # Filter the list to keep only packages that can be installed
+    declare -A reinstall_packages
+    while read -r pkgname; do
+        if [[ -v "on_root_packages[$pkgname]" ]]; then
+            reinstall_packages[$pkgname]=1
+        fi
+    done < <(gunzip -c /opt/var/opkg-lists/* | grep "^Package:" | awk '{print $2}')
+
+    # Workaround: Checking the size of an empty array when the nounset option
+    # is active may throw an error on some Bash versions, so we disable it
+    # temporarily
+    set +u
+    if [[ ${#reinstall_packages[@]} -ne 0 ]]; then
+        opkg install --force-reinstall "${!reinstall_packages[@]}"
+    else
+        echo "No package needs to be reinstalled"
+    fi
+    set -u
+}
+
+enable() {
+    add-bind-mount "$toltec_src" "$toltec_dest"
+    reinstall-root
+}
+
+disable() {
+    remove-bind-mount "$toltec_dest"
+}
+
+uninstall() {
+    # Remove all installed packages
+    opkg remove --force-depends "*"
+    systemctl daemon-reload
+
+    # Remove mount point
+    remove-bind-mount "$toltec_dest"
+    rmdir "$toltec_dest"
+
+    # Remove Toltec data
+    rm -r "$toltec_src"
+
+    # Unset PATH
+    start_marker="# Added by Toltec bootstrap (do not modify!)"
+    end_marker="# End of Toltec bootstrap additions"
+    sed -i "/^$start_marker\$/,/^$end_marker\$/d" /home/root/.bashrc
+}
+
+help() {
+    echo "Usage: $(basename "$0") COMMAND
+Manage your Toltec install. Available commands:
+
+    enable          Re-enable Toltec after a system update or after you
+                    disabled it manually.
+    disable         Disable (but do not uninstall) Toltec.
+    uninstall       Permanently remove Toltec."
+}
+
+if [[ $# -eq 0 ]]; then
+    help
+    exit 1
+fi
+
+case $1 in
+    enable) enable ;;
+    disable) disable ;;
+    uninstall) uninstall ;;
+    *)
+        echo -e "Error: Invalid command '$1'\n"
+        help
+        exit 1
+        ;;
+esac
