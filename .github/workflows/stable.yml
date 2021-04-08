@@ -12,8 +12,6 @@ jobs:
               uses: actions/checkout@v2
             - name: Create Github Release
               continue-on-error: true
-              uses: elgohr/Github-Release-Action@master
+              run: hub release create -t ${{ github.sha }} -m "Automated release on merge to stable" ${{ github.sha }} 
               env:
                 GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
-              with:
-                args: "Automated Release on push to stable"
